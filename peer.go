@@ -16,15 +16,18 @@ package p2p
 
 import (
 	"errors"
+	"sync"
+	"time"
 
 	tp "github.com/henrylee2cn/teleport"
 	"github.com/henrylee2cn/teleport/plugin"
 	heartbeat "github.com/henrylee2cn/tp-ext/plugin-heartbeat"
+	"github.com/libp2p/go-reuseport"
 )
 
 // TunnelPeerConfig p2p tunel config
 type TunnelPeerConfig struct {
-	PeerID             string        `yaml:"peer_id" ini:"peer_id" comment:"p2p tunel config"`
+	PeerId             string        `yaml:"peer_id" ini:"peer_id" comment:"p2p tunel config"`
 	Proxy              string        `yaml:"proxy"   ini:"proxy"   comment:"p2p tunel config"`
 	DefaultDialTimeout time.Duration `yaml:"default_dial_timeout" ini:"default_dial_timeout" comment:"Default maximum duration for dialing; for client role; ns,µs,ms,s,m,h"`
 	DefaultBodyCodec   string        `yaml:"default_body_codec"   ini:"default_body_codec"   comment:"Default body codec type id"`
@@ -47,7 +50,7 @@ func (p *TunnelPeerConfig) Reload(bind cfgo.BindFunc) error {
 }
 
 func (p *TunnelPeerConfig) check() error {
-	if p.PeerID == "" {
+	if p.PeerId == "" {
 		return errors.New("peer id is empty!")
 	}
 	if p.Proxy == "" {
@@ -59,7 +62,7 @@ func (p *TunnelPeerConfig) check() error {
 // TunnelPeer the communication peer which is server or client role
 type TunnelPeer interface {
 	tp.EarlyPeer
-	Tunnel() (Session, *Rerror)
+	Tunnel(peerId string) (Session, *Rerror)
 	// Dial connects with the peer of the destination address.
 	Dial(addr string, protoFunc ...socket.ProtoFunc) (Session, *Rerror)
 	// DialContext connects with the peer of the destination address, using the provided context.
@@ -69,32 +72,51 @@ type TunnelPeer interface {
 }
 
 type tunnelPeer struct {
+	peerId string
 	tp.Peer
+	proxyAddr    string
+	proxyPeer    tp.Peer
 	proxySession tp.Session
+	closeCh      chan struct{}
+	mu           sync.Mutex
 }
 
 func NewTunnelPeer(cfg TunnelPeerConfig, plugin ...Plugin) TunnelPeer {
-	cli := tp.NewPeer(tp.PeerConfig{
-		RedialTimes: 1024,
-	},
-		heartbeat.NewPong(),
-		plugin.LaunchAuth(func() { return cfg.PeerID }),
-	)
-	cli.RoutePull(new(notify))
-	sess, rerr := cli.Dial(cfg.ProxyTunnel)
+	t := &tunnelPeer{
+		peerId:       cfg.PeerId,
+		proxyAddr:    cfg.Proxy,
+		proxySession: sess,
+		proxyPeer: tp.NewPeer(
+			tp.PeerConfig{},
+			heartbeat.NewPing(10),
+		),
+	}
+	t.proxyPeer.RoutePull(new(notify))
+
+	rerr := t.connectProxy()
 	if rerr != nil {
 		tp.Fatalf("NewTunnelPeer: %v", rerr)
 	}
 
-	plugin = append(
-		[]tp.Plugin{
-			heartbeat.NewPong(),
-			heartbeat.NewPing(12),
-		},
-		plugin...,
-	)
+	go func() {
+		ticker := time.NewTicker(time.Second * 10)
+		for {
+			select {
+			case <-closeCh:
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				if !t.proxySession.Health() {
+					rerr := t.connectProxy()
+					if rerr != nil {
+						tp.Warnf("connect proxy: %v", rerr)
+					}
+				}
+			}
+		}
+	}()
 
-	peer := tp.NewPeer(tp.PeerConfig{
+	t.Peer = tp.NewPeer(tp.PeerConfig{
 		DefaultDialTimeout: cfg.DefaultDialTimeout,
 		DefaultBodyCodec:   cfg.DefaultBodyCodec,
 		DefaultSessionAge:  cfg.DefaultSessionAge,
@@ -102,26 +124,77 @@ func NewTunnelPeer(cfg TunnelPeerConfig, plugin ...Plugin) TunnelPeer {
 		SlowCometDuration:  cfg.SlowCometDuration,
 		PrintBody:          cfg.PrintBody,
 		CountTime:          cfg.CountTime,
-	}, plugin...)
+	}, append(
+		[]tp.Plugin{
+			heartbeat.NewPong(),
+			heartbeat.NewPing(12),
+		},
+		plugin...,
+	)...)
 
-	return &tunnelPeer{
-		Peer:         peer,
-		proxySession: sess,
+	return t
+}
+
+func (t *tunnelPeer) connectProxy() (rerr *Rerror) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		t.proxySession, rerr = t.proxyPeer.Dial(t.proxyAddr)
+		if rerr == nil {
+			t.proxySession.Swap().Store("tunnelPeer", t)
+			return t.proxySession.Pull("/p2p/online", &OnlineArgs{PeerId: t.peerId}, nil).Rerror()
+		}
 	}
+	return rerr
+}
+
+func (t *tunnelPeer) Tunnel(peerId string) (Session, *Rerror) {
+	reply := new(TunnelIps)
+	rerr := t.proxySession.Pull(
+		"/p2p/apply",
+		&ApplyArgs{t.peerId, peerId},
+		reply,
+	).Rerror()
+	if rerr != nil {
+		return nil, rerr
+	}
+
 }
 
 type notify struct {
 	tp.PullCtx
 }
 
-func (t *notify) Apply(args *ForwardArgs) (*struct{}, *tp.Rerror) {
+func (n *notify) Apply(args *ForwardArgs) (*struct{}, *tp.Rerror) {
 	// filter
 	// ...
 
 	// reply in a new connection
-
-	t.Peer().ServeConn(conn)
+	tunnelPeer, _ := n.Swap().Load("tunnelPeer")
+	go tunnelPeer.(*tunnelPeer).replyTunnel(args)
 	return nil, nil
+}
+
+func (t *tunnelPeer) replyTunnel(args *ForwardArgs) {
+	conn, err := reuseport.Dial("tcp", "", t.proxyAddr)
+	if err != nil {
+		return
+	}
+	sess, err := t.proxyPeer.ServeConn(conn)
+	if err != nil {
+		return
+	}
+	reply := new(TunnelIps)
+	rerr := sess.Pull("/p2p/reply", &ReplyArgs{TunnelId: args.TunnelId}, reply).Rerror()
+	if rerr != nil {
+		return
+	}
+	lis, err := reuseport.Listen("tcp", reply.PeerIp1)
+	if err != nil {
+		return
+	}
+	go t.Peer.ServeListener(lis)
+
 }
 
 type newAuthPlugin struct{}

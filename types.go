@@ -15,7 +15,7 @@
 package p2p
 
 type OnlineArgs struct {
-	Id string
+	PeerId string
 }
 type ApplyArgs struct {
 	PeerId1 string

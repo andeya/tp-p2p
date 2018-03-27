@@ -41,13 +41,15 @@ func (p *ProxyConfig) Reload(bind cfgo.BindFunc) error {
 }
 
 func Proxy(cfg ProxyConfig) {
-	svr := tp.NewPeer(tp.PeerConfig{
+	srv := tp.NewPeer(tp.PeerConfig{
 		CountTime:         cfg.CountTime,
 		ListenAddress:     cfg.ListenAddress,
 		SlowCometDuration: cfg.SlowCometDuration,
-	})
-	svr.RoutePull(new(p2p))
-	svr.Listen()
+	},
+		heartbeat.NewPong(),
+	)
+	srv.RoutePull(new(p2p))
+	srv.ListenAndServe()
 }
 
 var (
@@ -72,7 +74,7 @@ type p2p struct {
 }
 
 func (p *p2p) Online(args *OnlineArgs) (*struct{}, *tp.Rerror) {
-	if oldSess, ok := p.Session().Peer().GetSession(args.Id); ok {
+	if oldSess, ok := p.Session().Peer().GetSession(args.PeerId); ok {
 		oldSess.Close()
 	}
 	p.Session().SetId(args.Id)
