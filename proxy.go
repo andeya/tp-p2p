@@ -21,6 +21,7 @@ import (
 	"github.com/henrylee2cn/cfgo"
 	"github.com/henrylee2cn/goutil"
 	tp "github.com/henrylee2cn/teleport"
+	"github.com/henrylee2cn/tp-ext/plugin-heartbeat"
 )
 
 // ProxyConfig proxy peer config
@@ -56,6 +57,7 @@ var (
 	rerrNotOnline   = tp.NewRerror(10001, "Not Online", "")
 	rerrWaitTimeout = tp.NewRerror(10002, "Wait for the response from the peer to timeout", "")
 	rerrCanceled    = tp.NewRerror(10003, "Peer wait timeout, canceled apply", "")
+	rerrTunneling   = tp.NewRerror(10004, "Tunneling", "")
 )
 
 var cache = struct {
@@ -65,37 +67,37 @@ var cache = struct {
 	infos: make(map[string]*TunnelInfo),
 }
 
-type TunnelInfo struct {
-	ch chan struct{}
-	*TunnelIps
-}
-type p2p struct {
-	tp.PullCtx
-}
+type (
+	p2p struct {
+		tp.PullCtx
+	}
+	TunnelInfo struct {
+		ch       chan struct{}
+		fromAddr string
+		toAddr   string
+	}
+)
 
 func (p *p2p) Online(args *OnlineArgs) (*struct{}, *tp.Rerror) {
 	if oldSess, ok := p.Session().Peer().GetSession(args.PeerId); ok {
 		oldSess.Close()
 	}
-	p.Session().SetId(args.Id)
+	p.Session().SetId(args.PeerId)
 	return nil, nil
 }
 
-func (p *p2p) Apply(args *ApplyArgs) (*TunnelIps, *tp.Rerror) {
-	sess2, ok := p.Session().Peer().GetSession(args.PeerId2)
+func (p *p2p) Apply(args *ApplyArgs) (*TunnelAddrs, *tp.Rerror) {
+	sess2, ok := p.Session().Peer().GetSession(args.ToPeerId)
 	if !ok {
 		return nil, rerrNotOnline
 	}
 
-	tunnelId := args.PeerId1 + args.PeerId2 + goutil.URLRandomString(8)
-	peerIp1 := p.RealIp()
+	tunnelId := args.FromPeerId + args.ToPeerId + goutil.URLRandomString(8)
+	fromPeerIp := p.RealIp()
 
 	info := &TunnelInfo{
-		ch: make(chan struct{}),
-		TunnelIps: &TunnelIps{
-			TunnelId: tunnelId,
-			PeerIp1:  peerIp1,
-		},
+		ch:       make(chan struct{}),
+		fromAddr: fromPeerIp,
 	}
 
 	cache.mu.Lock()
@@ -109,34 +111,41 @@ func (p *p2p) Apply(args *ApplyArgs) (*TunnelIps, *tp.Rerror) {
 	}()
 
 	rerr := sess2.Pull("/notify/apply", ForwardArgs{
-		TunnelId: tunnelId,
-		PeerId1:  args.PeerId1,
+		TunnelId:   tunnelId,
+		FromPeerId: args.FromPeerId,
 	}, nil).Rerror()
 
 	if rerr != nil {
 		return nil, rerr
 	}
 
-	var peerIp2 string
 	select {
 	case <-time.After(time.Second * 2):
 		return nil, rerrWaitTimeout
 	case <-info.ch:
-		return info.TunnelIps, nil
+		return &TunnelAddrs{
+			TunnelId:   tunnelId,
+			LocalAddr:  info.fromAddr,
+			RemoteAddr: info.toAddr,
+		}, nil
 	}
 }
 
-func (p *p2p) Reply(args *ReplyArgs) (*TunnelIps, *tp.Rerror) {
+func (p *p2p) Reply(args *ReplyArgs) (*TunnelAddrs, *tp.Rerror) {
 	cache.mu.RLock()
 	info, ok := cache.infos[args.TunnelId]
 	cache.mu.RUnlock()
 	if !ok {
 		return nil, rerrCanceled
 	}
-	info.TunnelIps.PeerIp2 = p.RealIp()
+	info.toAddr = p.RealIp()
 	select {
 	case info.ch <- struct{}{}:
-		return info.TunnelIps, nil
+		return &TunnelAddrs{
+			TunnelId:   args.TunnelId,
+			LocalAddr:  info.toAddr,
+			RemoteAddr: info.fromAddr,
+		}, nil
 	default:
 		return nil, rerrCanceled
 	}

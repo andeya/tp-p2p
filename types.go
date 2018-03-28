@@ -18,17 +18,17 @@ type OnlineArgs struct {
 	PeerId string
 }
 type ApplyArgs struct {
-	PeerId1 string
-	PeerId2 string
+	FromPeerId string
+	ToPeerId   string
 }
 type ForwardArgs struct {
-	TunnelId string
-	PeerId1  string
+	TunnelId   string
+	FromPeerId string
 }
-type TunnelIps struct {
-	TunnelId string
-	PeerIp1  string
-	PeerIp2  string
+type TunnelAddrs struct {
+	TunnelId   string
+	LocalAddr  string
+	RemoteAddr string
 }
 type ReplyArgs struct {
 	TunnelId string

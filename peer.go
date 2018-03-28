@@ -15,18 +15,21 @@
 package p2p
 
 import (
+	"context"
 	"errors"
+	"net"
 	"sync"
 	"time"
 
+	"github.com/henrylee2cn/cfgo"
 	tp "github.com/henrylee2cn/teleport"
-	"github.com/henrylee2cn/teleport/plugin"
+	"github.com/henrylee2cn/teleport/socket"
 	heartbeat "github.com/henrylee2cn/tp-ext/plugin-heartbeat"
 	"github.com/libp2p/go-reuseport"
 )
 
-// TunnelPeerConfig p2p tunel config
-type TunnelPeerConfig struct {
+// PeerConfig p2p tunel config
+type PeerConfig struct {
 	PeerId             string        `yaml:"peer_id" ini:"peer_id" comment:"p2p tunel config"`
 	Proxy              string        `yaml:"proxy"   ini:"proxy"   comment:"p2p tunel config"`
 	DefaultDialTimeout time.Duration `yaml:"default_dial_timeout" ini:"default_dial_timeout" comment:"Default maximum duration for dialing; for client role; ns,µs,ms,s,m,h"`
@@ -38,10 +41,10 @@ type TunnelPeerConfig struct {
 	CountTime          bool          `yaml:"count_time"           ini:"count_time"           comment:"Is count cost time or not"`
 }
 
-var _ cfgo.Config = new(TunnelPeerConfig)
+var _ cfgo.Config = new(PeerConfig)
 
 // Reload Bi-directionally synchronizes config between YAML file and memory.
-func (p *TunnelPeerConfig) Reload(bind cfgo.BindFunc) error {
+func (p *PeerConfig) Reload(bind cfgo.BindFunc) error {
 	err := bind()
 	if err != nil {
 		return err
@@ -49,7 +52,7 @@ func (p *TunnelPeerConfig) Reload(bind cfgo.BindFunc) error {
 	return p.check()
 }
 
-func (p *TunnelPeerConfig) check() error {
+func (p *PeerConfig) check() error {
 	if p.PeerId == "" {
 		return errors.New("peer id is empty!")
 	}
@@ -59,54 +62,57 @@ func (p *TunnelPeerConfig) check() error {
 	return nil
 }
 
-// TunnelPeer the communication peer which is server or client role
-type TunnelPeer interface {
+// Peer the communication peer which is server or client role
+type Peer interface {
 	tp.EarlyPeer
-	Tunnel(peerId string) (Session, *Rerror)
+	Tunnel(peerId string) (tp.Session, *tp.Rerror)
 	// Dial connects with the peer of the destination address.
-	Dial(addr string, protoFunc ...socket.ProtoFunc) (Session, *Rerror)
+	Dial(addr string, protoFunc ...socket.ProtoFunc) (tp.Session, *tp.Rerror)
 	// DialContext connects with the peer of the destination address, using the provided context.
-	DialContext(ctx context.Context, addr string, protoFunc ...socket.ProtoFunc) (Session, *Rerror)
+	DialContext(ctx context.Context, addr string, protoFunc ...socket.ProtoFunc) (tp.Session, *tp.Rerror)
 	// ServeConn serves the connection and returns a session.
-	ServeConn(conn net.Conn, protoFunc ...socket.ProtoFunc) (Session, error)
+	ServeConn(conn net.Conn, protoFunc ...socket.ProtoFunc) (tp.Session, error)
 }
 
 type tunnelPeer struct {
 	peerId string
 	tp.Peer
-	proxyAddr    string
-	proxyPeer    tp.Peer
-	proxySession tp.Session
-	closeCh      chan struct{}
-	mu           sync.Mutex
+	proxyAddr     string
+	proxyPeer     tp.Peer
+	proxySession  tp.Session
+	closeCh       chan struct{}
+	tunneling     map[string]bool
+	tunnelingLock sync.Mutex
+	mu            sync.RWMutex
 }
 
-func NewTunnelPeer(cfg TunnelPeerConfig, plugin ...Plugin) TunnelPeer {
+func NewPeer(cfg PeerConfig, plugin ...tp.Plugin) Peer {
 	t := &tunnelPeer{
-		peerId:       cfg.PeerId,
-		proxyAddr:    cfg.Proxy,
-		proxySession: sess,
+		peerId:    cfg.PeerId,
+		proxyAddr: cfg.Proxy,
 		proxyPeer: tp.NewPeer(
 			tp.PeerConfig{},
 			heartbeat.NewPing(10),
 		),
+		closeCh:   make(chan struct{}),
+		tunneling: make(map[string]bool, 100),
 	}
 	t.proxyPeer.RoutePull(new(notify))
 
 	rerr := t.connectProxy()
 	if rerr != nil {
-		tp.Fatalf("NewTunnelPeer: %v", rerr)
+		tp.Fatalf("NewPeer: %v", rerr)
 	}
 
 	go func() {
 		ticker := time.NewTicker(time.Second * 10)
 		for {
 			select {
-			case <-closeCh:
+			case <-t.closeCh:
 				ticker.Stop()
 				return
 			case <-ticker.C:
-				if !t.proxySession.Health() {
+				if !t.getProxySession().Health() {
 					rerr := t.connectProxy()
 					if rerr != nil {
 						tp.Warnf("connect proxy: %v", rerr)
@@ -134,8 +140,13 @@ func NewTunnelPeer(cfg TunnelPeerConfig, plugin ...Plugin) TunnelPeer {
 
 	return t
 }
-
-func (t *tunnelPeer) connectProxy() (rerr *Rerror) {
+func (t *tunnelPeer) getProxySession() tp.Session {
+	t.mu.RLock()
+	sess := t.proxySession
+	t.mu.RUnlock()
+	return sess
+}
+func (t *tunnelPeer) connectProxy() (rerr *tp.Rerror) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for i := 0; i < 3; i++ {
@@ -148,9 +159,34 @@ func (t *tunnelPeer) connectProxy() (rerr *Rerror) {
 	return rerr
 }
 
-func (t *tunnelPeer) Tunnel(peerId string) (Session, *Rerror) {
-	reply := new(TunnelIps)
-	rerr := t.proxySession.Pull(
+func (t *tunnelPeer) Tunnel(peerId string) (tp.Session, *tp.Rerror) {
+	sess, ok := t.Peer.GetSession(peerId)
+	if ok {
+		return sess, nil
+	}
+	t.tunnelingLock.Lock()
+	if t.tunneling[peerId] {
+		t.tunnelingLock.Unlock()
+		return nil, rerrTunneling
+	}
+	t.tunneling[peerId] = true
+	t.tunnelingLock.Unlock()
+
+	defer func() {
+		t.tunnelingLock.Lock()
+		delete(t.tunneling, peerId)
+		t.tunnelingLock.Unlock()
+	}()
+
+	conn, err := reuseport.Dial("tcp", "", t.proxyAddr)
+	if err != nil {
+		return nil, tp.NewRerror(tp.CodeDialFailed, tp.CodeText(tp.CodeDialFailed), err.Error())
+	}
+	localAddr := conn.LocalAddr().String()
+	sess, _ = t.proxyPeer.ServeConn(conn)
+	defer sess.Close()
+	reply := new(TunnelAddrs)
+	rerr := sess.Pull(
 		"/p2p/apply",
 		&ApplyArgs{t.peerId, peerId},
 		reply,
@@ -158,7 +194,11 @@ func (t *tunnelPeer) Tunnel(peerId string) (Session, *Rerror) {
 	if rerr != nil {
 		return nil, rerr
 	}
-
+	sess, err = t.doTunnel(localAddr, peerId, reply)
+	if err != nil {
+		return nil, tp.NewRerror(tp.CodeDialFailed, tp.CodeText(tp.CodeDialFailed), err.Error())
+	}
+	return sess, nil
 }
 
 type notify struct {
@@ -166,49 +206,106 @@ type notify struct {
 }
 
 func (n *notify) Apply(args *ForwardArgs) (*struct{}, *tp.Rerror) {
-	// filter
-	// ...
+	p, _ := n.Swap().Load("tunnelPeer")
+	peer := p.(*tunnelPeer)
 
+	// filter
+	peer.tunnelingLock.Lock()
+	if peer.tunneling[args.FromPeerId] {
+		peer.tunnelingLock.Unlock()
+		return nil, rerrTunneling
+	}
+	peer.tunneling[args.FromPeerId] = true
+	peer.tunnelingLock.Unlock()
 	// reply in a new connection
-	tunnelPeer, _ := n.Swap().Load("tunnelPeer")
-	go tunnelPeer.(*tunnelPeer).replyTunnel(args)
+	go peer.replyTunnel(args)
 	return nil, nil
 }
 
 func (t *tunnelPeer) replyTunnel(args *ForwardArgs) {
+	defer func() {
+		t.tunnelingLock.Lock()
+		delete(t.tunneling, args.FromPeerId)
+		t.tunnelingLock.Unlock()
+	}()
 	conn, err := reuseport.Dial("tcp", "", t.proxyAddr)
 	if err != nil {
 		return
 	}
-	sess, err := t.proxyPeer.ServeConn(conn)
-	if err != nil {
-		return
-	}
-	reply := new(TunnelIps)
+	localAddr := conn.LocalAddr().String()
+	sess, _ := t.proxyPeer.ServeConn(conn)
+	defer sess.Close()
+	reply := new(TunnelAddrs)
 	rerr := sess.Pull("/p2p/reply", &ReplyArgs{TunnelId: args.TunnelId}, reply).Rerror()
 	if rerr != nil {
 		return
 	}
-	lis, err := reuseport.Listen("tcp", reply.PeerIp1)
+	t.doTunnel(localAddr, args.FromPeerId, reply)
+}
+
+func (t *tunnelPeer) doTunnel(localAddr, remotePeerId string, addrs *TunnelAddrs) (tp.Session, error) {
+	tp.Debugf("local: %s, localNat: %s, remoteNat: %s", localAddr, addrs.LocalAddr, addrs.RemoteAddr)
+	// addrs.LocalAddr = localAddr
+	lis, err := reuseport.Listen("tcp", addrs.LocalAddr)
 	if err != nil {
-		return
+		return nil, err
 	}
-	go t.Peer.ServeListener(lis)
+	defer lis.Close()
 
-}
+	connCh := make(chan net.Conn, 1)
 
-type newAuthPlugin struct{}
+	go func() {
+		var closeCh = t.closeCh
+		for {
+			conn, e := lis.Accept()
+			if e != nil {
+				select {
+				case <-closeCh:
+					return
+				default:
+				}
+				continue
+			}
+			select {
+			case connCh <- conn:
+			default:
+			}
+			return
+		}
+	}()
+	var closeCh = make(chan struct{})
+	defer close(closeCh)
+	go func() {
+		for i := 0; i < 10; i++ {
+			select {
+			case <-closeCh:
+				return
+			default:
+			}
+			conn, err := reuseport.Dial("tcp", addrs.LocalAddr, addrs.RemoteAddr)
+			if err == nil {
+				select {
+				case connCh <- conn:
+				default:
+				}
+				return
+			}
+			tp.Debugf("%v", err)
+			time.Sleep(time.Millisecond * 200)
+		}
+	}()
 
-func (d *newAuthPlugin) Name() string {
-	return "auth"
-}
-
-func (t *newAuthPlugin) PostDial(sess tp.PreSession) *tp.Rerror {
-
-	return nil
-}
-
-func (t *newAuthPlugin) PostAccept(sess tp.PreSession) *tp.Rerror {
-
-	return nil
+	select {
+	case conn := <-connCh:
+		sess, err := t.Peer.ServeConn(conn)
+		if err != nil {
+			return nil, err
+		}
+		sess.SetId(remotePeerId)
+		// TODO: check tunnel id
+		tp.Infof("tunnel to peer: %s", remotePeerId)
+		return sess, nil
+	case <-time.After(time.Second * 5):
+		return nil, errors.New("Tunnel Timeout")
+	}
 }
