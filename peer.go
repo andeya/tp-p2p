@@ -37,7 +37,7 @@ type PeerConfig struct {
 	DefaultSessionAge  time.Duration `yaml:"default_session_age"  ini:"default_session_age"  comment:"Default session max age, if less than or equal to 0, no time limit; ns,µs,ms,s,m,h"`
 	DefaultContextAge  time.Duration `yaml:"default_context_age"  ini:"default_context_age"  comment:"Default PULL or PUSH context max age, if less than or equal to 0, no time limit; ns,µs,ms,s,m,h"`
 	SlowCometDuration  time.Duration `yaml:"slow_comet_duration"  ini:"slow_comet_duration"  comment:"Slow operation alarm threshold; ns,µs,ms,s ..."`
-	PrintBody          bool          `yaml:"print_body"           ini:"print_body"           comment:"Is print body or not"`
+	PrintDetail        bool          `yaml:"print_detail"         ini:"print_detail"         comment:"Is print body and metadata or not"`
 	CountTime          bool          `yaml:"count_time"           ini:"count_time"           comment:"Is count cost time or not"`
 }
 
@@ -81,7 +81,7 @@ type tunnelPeer struct {
 	proxyPeer     tp.Peer
 	proxySession  tp.Session
 	closeCh       chan struct{}
-	tunneling     map[string]bool
+	tunneling     map[string]chan *tp.Rerror
 	tunnelingLock sync.Mutex
 	mu            sync.RWMutex
 }
@@ -95,7 +95,7 @@ func NewPeer(cfg PeerConfig, plugin ...tp.Plugin) Peer {
 			heartbeat.NewPing(10),
 		),
 		closeCh:   make(chan struct{}),
-		tunneling: make(map[string]bool, 100),
+		tunneling: make(map[string]chan *tp.Rerror, 100),
 	}
 	t.proxyPeer.RoutePull(new(notify))
 
@@ -128,7 +128,7 @@ func NewPeer(cfg PeerConfig, plugin ...tp.Plugin) Peer {
 		DefaultSessionAge:  cfg.DefaultSessionAge,
 		DefaultContextAge:  cfg.DefaultContextAge,
 		SlowCometDuration:  cfg.SlowCometDuration,
-		PrintBody:          cfg.PrintBody,
+		PrintDetail:        cfg.PrintDetail,
 		CountTime:          cfg.CountTime,
 	}, append(
 		[]tp.Plugin{
@@ -159,21 +159,25 @@ func (t *tunnelPeer) connectProxy() (rerr *tp.Rerror) {
 	return rerr
 }
 
-func (t *tunnelPeer) Tunnel(peerId string) (tp.Session, *tp.Rerror) {
+func (t *tunnelPeer) Tunnel(peerId string) (sess tp.Session, rerr *tp.Rerror) {
 	sess, ok := t.Peer.GetSession(peerId)
 	if ok {
 		return sess, nil
 	}
 	t.tunnelingLock.Lock()
-	if t.tunneling[peerId] {
+	if ch, ok := t.tunneling[peerId]; ok {
 		t.tunnelingLock.Unlock()
-		return nil, rerrTunneling
+		sess, _ = t.Peer.GetSession(peerId)
+		return sess, <-ch
 	}
-	t.tunneling[peerId] = true
+	ch := make(chan *tp.Rerror, 1)
+	t.tunneling[peerId] = ch
 	t.tunnelingLock.Unlock()
 
 	defer func() {
 		t.tunnelingLock.Lock()
+		ch <- rerr
+		close(ch)
 		delete(t.tunneling, peerId)
 		t.tunnelingLock.Unlock()
 	}()
@@ -186,7 +190,7 @@ func (t *tunnelPeer) Tunnel(peerId string) (tp.Session, *tp.Rerror) {
 	sess, _ = t.proxyPeer.ServeConn(conn)
 	defer sess.Close()
 	reply := new(TunnelAddrs)
-	rerr := sess.Pull(
+	rerr = sess.Pull(
 		"/p2p/apply",
 		&ApplyArgs{t.peerId, peerId},
 		reply,
@@ -211,20 +215,24 @@ func (n *notify) Apply(args *ForwardArgs) (*struct{}, *tp.Rerror) {
 
 	// filter
 	peer.tunnelingLock.Lock()
-	if peer.tunneling[args.FromPeerId] {
+	if _, ok := peer.tunneling[args.FromPeerId]; ok {
 		peer.tunnelingLock.Unlock()
 		return nil, rerrTunneling
 	}
-	peer.tunneling[args.FromPeerId] = true
+	ch := make(chan *tp.Rerror, 1)
+	peer.tunneling[args.FromPeerId] = ch
 	peer.tunnelingLock.Unlock()
 	// reply in a new connection
-	go peer.replyTunnel(args)
+	go peer.replyTunnel(ch, args)
 	return nil, nil
 }
 
-func (t *tunnelPeer) replyTunnel(args *ForwardArgs) {
+func (t *tunnelPeer) replyTunnel(ch chan *tp.Rerror, args *ForwardArgs) {
+	var rerr *tp.Rerror
 	defer func() {
 		t.tunnelingLock.Lock()
+		ch <- rerr
+		close(ch)
 		delete(t.tunneling, args.FromPeerId)
 		t.tunnelingLock.Unlock()
 	}()
@@ -236,16 +244,19 @@ func (t *tunnelPeer) replyTunnel(args *ForwardArgs) {
 	sess, _ := t.proxyPeer.ServeConn(conn)
 	defer sess.Close()
 	reply := new(TunnelAddrs)
-	rerr := sess.Pull("/p2p/reply", &ReplyArgs{TunnelId: args.TunnelId}, reply).Rerror()
+	rerr = sess.Pull("/p2p/reply", &ReplyArgs{TunnelId: args.TunnelId}, reply).Rerror()
 	if rerr != nil {
 		return
 	}
-	t.doTunnel(localAddr, args.FromPeerId, reply)
+	_, err = t.doTunnel(localAddr, args.FromPeerId, reply)
+	if err != nil {
+		rerr = tp.NewRerror(tp.CodeDialFailed, tp.CodeText(tp.CodeDialFailed), err.Error())
+	}
 }
 
 func (t *tunnelPeer) doTunnel(localAddr, remotePeerId string, addrs *TunnelAddrs) (tp.Session, error) {
 	tp.Debugf("local: %s, localNat: %s, remoteNat: %s", localAddr, addrs.LocalAddr, addrs.RemoteAddr)
-	// addrs.LocalAddr = localAddr
+	addrs.LocalAddr = localAddr
 	lis, err := reuseport.Listen("tcp", addrs.LocalAddr)
 	if err != nil {
 		return nil, err

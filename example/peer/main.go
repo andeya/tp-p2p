@@ -19,10 +19,10 @@ var (
 func main() {
 	flag.Parse()
 	var cfg = p2p.PeerConfig{
-		PeerId:    *id,
-		Proxy:     *proxy,
-		PrintBody: true,
-		CountTime: true,
+		PeerId:      *id,
+		Proxy:       *proxy,
+		PrintDetail: true,
+		CountTime:   true,
 	}
 	peer := p2p.NewPeer(cfg)
 	peer.RoutePush(new(chat))
